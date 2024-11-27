@@ -629,7 +629,7 @@ namespace PSE::WFC
 
     bool WaveFunctionCollapse::Propagate(Grid &Grid, const AdjacencyRules &AdjacencyRules, std::size_t CellX, std::size_t CellY)
     {
-        std::cout << "Propagating constraints...\n";
+        // std::cout << "Propagating constraints...\n";
 
         // Queue to keep track of cells that need to be processed
         std::queue<std::pair<std::size_t, std::size_t>> Queue;
@@ -795,6 +795,16 @@ namespace PSE::WFC
         return true;
     }
 
+    // Custom hash function for std::pair<std::size_t, std::size_t>
+    struct pair_hash
+    {
+        std::size_t operator()(const std::pair<std::size_t, std::size_t> &p) const
+        {
+            // A simple combination of the two size_t values.
+            // You can use a more sophisticated method if needed.
+            return std::hash<std::size_t>()(p.first) ^ (std::hash<std::size_t>()(p.second) << 1);
+        }
+    };
     bool WaveFunctionCollapse::PropagateWithBackTrack(Grid &Grid, const AdjacencyRules &AdjacencyRules, std::size_t CellX, std::size_t CellY)
     {
         std::cout << "Propagating constraints with backtracking...\n";
@@ -811,6 +821,9 @@ namespace PSE::WFC
         // Start propagation from the given cell
         Queue.emplace(CellX, CellY);
 
+        // Initialize the map to track which patterns have been tried for each cell
+        std::unordered_map<std::pair<std::size_t, std::size_t>, std::size_t, pair_hash> TriedPatterns;
+
         while (!Queue.empty())
         {
             auto [CurrentX, CurrentY] = Queue.front();
@@ -819,12 +832,16 @@ namespace PSE::WFC
             Cell &CurrentCell = Grid[CurrentX][CurrentY];
 
             // Get the possible patterns for the current cell
-            std::vector<PatternIdx> CurrentPossiblePatterns = CurrentCell.PossiblePatterns;
-
-            // If the cell is collapsed, possible patterns is the single collapsed pattern
+            std::vector<PatternIdx> CurrentPossiblePatterns;
             if (CurrentCell.CollapsedPatternIdx.has_value())
             {
+                // If the cell is collapsed, possible patterns is the single collapsed pattern
                 CurrentPossiblePatterns = {CurrentCell.CollapsedPatternIdx.value()};
+            }
+            else
+            {
+                // If the cell is not collapsed, use its possible patterns
+                CurrentPossiblePatterns = CurrentCell.PossiblePatterns;
             }
 
             // Define neighbor positions: Left, Right, Top, Bottom
@@ -941,6 +958,7 @@ namespace PSE::WFC
                     }
                     else
                     {
+                        // If not compatible, mark as changed
                         Changed = true;
                     }
                 }
@@ -963,25 +981,44 @@ namespace PSE::WFC
                             Grid = GridStack.top();
                             GridStack.pop();
 
-                            // Remove the last saved state since it's the state that led to contradiction
-                            if (!GridStack.empty())
+                            // Identify the cell that caused the contradiction
+                            auto cellKey = std::make_pair(NeighborX, NeighborY);
+                            auto it = TriedPatterns.find(cellKey);
+                            if (it == TriedPatterns.end())
                             {
-                                Grid = GridStack.top();
-                                GridStack.pop();
+                                TriedPatterns[cellKey] = 0;
+                            }
+
+                            // Get the index of the last tried pattern
+                            size_t lastTriedIndex = TriedPatterns[cellKey];
+
+                            if (lastTriedIndex < Grid[NeighborX][NeighborY].PossiblePatterns.size())
+                            {
+                                // Remove the last tried pattern
+                                PatternIdx triedPattern = Grid[NeighborX][NeighborY].PossiblePatterns[lastTriedIndex];
+                                Grid[NeighborX][NeighborY].PossiblePatterns.erase(Grid[NeighborX][NeighborY].PossiblePatterns.begin() + lastTriedIndex);
+                                std::cerr << "Removing tried pattern " << triedPattern << " from cell (" << NeighborX << ", " << NeighborY << ")\n";
+                            }
+
+                            // Increment the tried pattern index
+                            TriedPatterns[cellKey]++;
+
+                            // Check if all patterns have been tried
+                            if (TriedPatterns[cellKey] >= Grid[NeighborX][NeighborY].PossiblePatterns.size())
+                            {
+                                // No patterns left to try, need to backtrack further
+                                std::cerr << "No patterns left to try for cell (" << NeighborX << ", " << NeighborY << "). Continuing backtrack...\n";
+                                Queue.emplace(CellX, CellY);
                             }
                             else
                             {
-                                // No more states to backtrack to
-                                std::cerr << "No more states to backtrack to. Failure.\n";
-                                return false;
+                                // Assign the next pattern
+                                PatternIdx newPattern = Grid[NeighborX][NeighborY].PossiblePatterns[lastTriedIndex];
+                                Grid[NeighborX][NeighborY].CollapsedPatternIdx = newPattern;
+                                std::cerr << "Assigning new pattern " << newPattern << " to cell (" << NeighborX << ", " << NeighborY << ")\n";
+                                // Enqueue the cell to propagate further
+                                Queue.emplace(NeighborX, NeighborY);
                             }
-
-                            // Clear the queue and start over
-                            while (!Queue.empty())
-                                Queue.pop();
-
-                            // Re-enqueue the cell to try alternative possibilities
-                            Queue.emplace(CellX, CellY);
                         }
                         else
                         {
@@ -1129,18 +1166,21 @@ namespace PSE::WFC
         const auto AdjacencyRules = ExtractAdjacencyRules(UniquePatterns, Params.PatSize, InputImage);
 
         // Visualize the adjacency rules
-        VisualizeAdjacencyRules(AdjacencyRules);
+        // VisualizeAdjacencyRules(AdjacencyRules);
 
         // Initialize the grid with all patterns as possible in each cell
         auto Grid = InitializeGrid(Params.GridSize, UniquePatterns);
 
         // Visualize the initial grid entropy values
-        VisualizeGridEntropy(Grid);
+        // VisualizeGridEntropy(Grid);
 
         // Choose a random cell to collapse
         std::random_device RD{};
         std::mt19937 RNG{RD()};
         std::uniform_int_distribution<std::size_t> Dist{0, Params.GridSize - 1};
+
+        const auto MaxRetries{1000};
+        std::size_t RetryCount{0};
 
         while (true)
         {
@@ -1151,12 +1191,20 @@ namespace PSE::WFC
             CellToCollapse.CollapsedPatternIdx = CellToCollapse.PossiblePatterns[Dist(RNG) % CellToCollapse.PossiblePatterns.size()];
 
             // Propagate constraints
-            if (!PropagateWithBackTrack(Grid, AdjacencyRules, RandomX, RandomY))
+            if (!Propagate(Grid, AdjacencyRules, RandomX, RandomY))
             {
-                // Visualize the grid entropy values
-                VisualizeGridEntropy(Grid);
+                if (++RetryCount >= MaxRetries)
+                {
+                    std::cerr << "Max retries reached. Aborting...\n";
 
-                return false;
+                    VisualizeGridEntropy(Grid);
+
+                    return false;
+                }
+
+                // Reset the grid
+                Grid = InitializeGrid(Params.GridSize, UniquePatterns);
+                continue;
             }
 
             if (std::all_of(Grid.begin(), Grid.end(), [](const auto &Row)
@@ -1169,7 +1217,7 @@ namespace PSE::WFC
         }
 
         // Visualize the grid entropy values
-        VisualizeGridEntropy(Grid);
+        // VisualizeGridEntropy(Grid);
 
         // Save the output image
         const auto NumPatternsPerRow = ((std::get<0>(InputImage) - Params.PatSize) / (Params.PatSize - 1)) + 1;
@@ -1195,7 +1243,7 @@ namespace PSE::WFC
                         // Get the pixel data from the pattern
                         auto &Pixel = PatternData[py * Params.PatSize + px];
 
-                        std::cout << "Pixel: " << (int)std::get<0>(Pixel) << " " << (int)std::get<1>(Pixel) << " " << (int)std::get<2>(Pixel) << " " << (int)std::get<3>(Pixel) << "\n";
+                        // std::cout << "Pixel: " << (int)std::get<0>(Pixel) << " " << (int)std::get<1>(Pixel) << " " << (int)std::get<2>(Pixel) << " " << (int)std::get<3>(Pixel) << "\n";
 
                         // Calculate the index in the output image
                         std::size_t OutputIndex = ((y * Params.PatSize + py) * OutputWidth + (x * Params.PatSize + px)) * 4;
